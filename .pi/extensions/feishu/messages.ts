@@ -87,6 +87,10 @@ export function parseMessageInput(
       collectAttachments(json, attachments);
       return { text: "", attachments, source: "file" };
     }
+    if (msg.msgType === "audio" && typeof json.file_key === "string" && json.file_key) {
+      attachments.push({ kind: "audio", fileKey: json.file_key });
+      return { text: "", attachments, source: "audio" };
+    }
     collectAttachments(json, attachments);
     if (attachments.length) return { text: "", attachments, source: msg.msgType };
   } catch {}

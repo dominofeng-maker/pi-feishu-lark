@@ -1,4 +1,4 @@
-import { detectCodeLanguage, decodeTextFile, detectImageMime, type FeishuImageInput, isSupportedImageMime, isSupportedTextFile } from "./attachments.js";
+import { detectCodeLanguage, decodeTextFile, detectImageMime, type FeishuImageInput, isSupportedImageMime, isSupportedTextFile, saveAudioResource, transcribeAudioLocal } from "./attachments.js";
 import { buildModelCard, buildResumeCard, buildThinkingCard } from "./cards.js";
 import type { ConversationManager } from "./conversation-manager.js";
 import { claimFeishuMessage, markFeishuMessage } from "./dedupe-store.js";
@@ -321,7 +321,7 @@ export class FeishuMessageHandler {
 
   private async processAttachments(
     msg: FeishuMessage,
-    attachments: Array<{ kind: "image" | "file"; fileKey: string; fileName?: string }>,
+    attachments: Array<{ kind: "image" | "file" | "audio"; fileKey: string; fileName?: string }>,
     modelSupportsImage: boolean,
   ) {
     const transport = this.getTransport();
@@ -331,6 +331,46 @@ export class FeishuMessageHandler {
     let skippedImageCount = 0;
 
     for (const attachment of attachments) {
+      if (attachment.kind === "audio") {
+        if (!transport) {
+          downloadErrors.push("飞书连接不可用，音频无法下载");
+          continue;
+        }
+        try {
+          const resource = await withTimeout(
+            transport.downloadMessageResource(msg.messageId, attachment.fileKey, "file"),
+            15000,
+            "音频下载超时",
+          );
+          const saved = saveAudioResource(msg.messageId, attachment.fileKey, resource.bytes);
+          debugLog("feishu.handler.audio_saved", {
+            messageId: msg.messageId,
+            fileKey: attachment.fileKey,
+            path: saved.path,
+            size: saved.size,
+          });
+          // 本地 FunASR 转写（SenseVoiceSmall，支持中/英/粤/日/韩）；失败时降级为路径提示
+          const transcript = await transcribeAudioLocal(saved.path, 25_000);
+          if (transcript) {
+            fileSections.push(
+              `[飞书语音消息转写]\n${transcript}\n[音频已保存: ${saved.path}]`,
+            );
+          } else {
+            fileSections.push(
+              `[飞书语音附件已保存: ${saved.path}]（本地转写暂不可用，请用 pi-local-perception stt 转写该文件）`,
+            );
+          }
+        } catch (error) {
+          debugLog("feishu.handler.audio_error", {
+            messageId: msg.messageId,
+            fileKey: attachment.fileKey,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          downloadErrors.push(error instanceof Error ? error.message : "音频下载失败");
+        }
+        continue;
+      }
+
       if (attachment.kind === "image") {
         if (!modelSupportsImage) {
           skippedImageCount += 1;

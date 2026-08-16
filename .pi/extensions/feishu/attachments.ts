@@ -1,4 +1,12 @@
+import { execFile } from "node:child_process";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import path from "node:path";
+
 export type FeishuImageInput = { type: "image"; data: string; mimeType: string };
+
+/** 飞书语音消息落盘目录（Ogg Opus 16kHz，飞书语音消息的原始格式） */
+export const AUDIO_MEDIA_DIR = path.join(homedir(), ".pi", "agent", "media", "audio");
 
 const SUPPORTED_IMAGE_MIME = new Set(["image/png", "image/jpeg", "image/webp"]);
 const SUPPORTED_TEXT_EXT = new Set([
@@ -78,4 +86,62 @@ function looksBinary(bytes: Buffer) {
     if (ch < 8 || (ch > 13 && ch < 32)) controlCount += 1;
   }
   return controlCount / sampleLen > 0.08;
+}
+
+/**
+ * 将飞书语音资源保存到本地（Ogg Opus），返回落盘路径。
+ * 文件扩展名固定为 .ogg（飞书语音消息格式为 Ogg Opus 16kHz mono）。
+ */
+export function saveAudioResource(messageId: string, fileKey: string, bytes: Buffer): { path: string; size: number } {
+  mkdirSync(AUDIO_MEDIA_DIR, { recursive: true });
+  const safeId = fileKey.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const filePath = path.join(AUDIO_MEDIA_DIR, `${messageId}-${safeId}.ogg`);
+  writeFileSync(filePath, bytes);
+  return { path: filePath, size: bytes.length };
+}
+
+/**
+ * 调用本地 FunASR（pi-local-perception stt）转写音频，返回转写文本。
+ * 任何失败（服务未启动/超时/解析错误）都返回 null，由调用方降级处理。
+ */
+export function transcribeAudioLocal(filePath: string, timeoutMs = 25_000): Promise<string | null> {
+  return new Promise((resolve) => {
+    const candidates = [
+      process.env.PI_LOCAL_PERCEPTION_BIN,
+      path.join(homedir(), ".local", "bin", "pi-local-perception"),
+      "pi-local-perception",
+    ].filter((p): p is string => Boolean(p));
+    let helper: string | undefined;
+    for (const candidate of candidates) {
+      if (candidate === "pi-local-perception" || candidate.includes("/")) {
+        helper = candidate;
+        break;
+      }
+    }
+    if (!helper) {
+      resolve(null);
+      return;
+    }
+    execFile(
+      helper,
+      ["stt", filePath],
+      { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 },
+      (error, stdout) => {
+        if (error) {
+          resolve(null);
+          return;
+        }
+        try {
+          const parsed = JSON.parse(stdout) as { ok?: boolean; text?: string };
+          if (parsed?.ok && typeof parsed.text === "string" && parsed.text.trim()) {
+            resolve(parsed.text.trim());
+            return;
+          }
+        } catch {
+          // fallthrough
+        }
+        resolve(null);
+      },
+    );
+  });
 }

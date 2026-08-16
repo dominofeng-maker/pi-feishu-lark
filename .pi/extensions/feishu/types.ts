@@ -105,7 +105,7 @@ export type FeishuMessage = {
 };
 
 export type FeishuAttachment = {
-  kind: "image" | "file";
+  kind: "image" | "file" | "audio";
   fileKey: string;
   fileName?: string;
 };
