@@ -4,8 +4,19 @@ import { dirname, join } from "node:path";
 import { debugLog } from "./debug.js";
 
 const LOCK_KEY = "pi-feishu-lark.feishu-gateway";
-const LOCKS_PATH = join(homedir(), ".pi", "agent", "locks.json");
-const LOCK_STALE_MS = 30_000;
+const LOCKS_PATH = process.env.PI_FEISHU_LOCK_PATH || join(homedir(), ".pi", "agent", "locks.json");
+/**
+ * 心跳软过期阈值。进程活着但心跳停摆 ≤ 该值时，锁仍视为有效（busy），
+ * 给事件循环短暂卡顿的 daemon 恢复机会，避免被下一个 pi 进程轻易抢占。
+ */
+const LOCK_STALE_MS = 90_000;
+/**
+ * 硬接管阈值。进程活着但心跳停摆超过该值，视为进程卡死（事件循环已不可用），
+ * 允许新实例接管。
+ */
+const LOCK_HARD_TAKEOVER_MS = 300_000;
+/** 文件锁目录的过期清理阈值（独立于网关锁，保持原 30s 语义）。 */
+const FILE_LOCK_STALE_MS = 30_000;
 const LOCK_RETRY_MS = 25;
 const LOCK_ATTEMPTS = 40;
 const HEARTBEAT_MS = 5_000;
@@ -94,11 +105,13 @@ export async function acquireGatewayLock(cwd: string, force = false): Promise<Ga
   return withLocksFileLock(() => {
     const locks = readLocksFile();
     const existing = asGatewayOwner(locks[LOCK_KEY]);
-    if (existing && !force && !isStale(existing)) {
+    if (existing && !force && !shouldTakeover(existing)) {
       debugLog("feishu.gateway.lock_busy", {
         ownerPid: existing.pid,
         heartbeatAt: existing.heartbeatAt,
         currentPid: process.pid,
+        alive: isProcessAlive(existing.pid),
+        heartbeatStale: isHeartbeatExpired(existing),
       });
       return { status: "busy", owner: existing };
     }
@@ -126,7 +139,9 @@ export async function acquireGatewayLock(cwd: string, force = false): Promise<Ga
 
 export function readGatewayOwner(): GatewayOwner | undefined {
   const owner = asGatewayOwner(readLocksFile()[LOCK_KEY]);
-  return owner && !isStale(owner) ? owner : undefined;
+  // 进程活着即视为有活跃网关（心跳短暂停摆不当作无主，避免 startDaemon
+  // 把「锁过期但进程存活」误判为「无网关在跑」而反复 spawn 抢占）。
+  return owner && isProcessAlive(owner.pid) ? owner : undefined;
 }
 
 export function gatewayLockPath() {
@@ -143,11 +158,21 @@ function asGatewayOwner(value: unknown): GatewayOwner | undefined {
   return raw as GatewayOwner;
 }
 
-function isStale(owner: GatewayOwner) {
+/** 是否应接管：进程已死，或心跳停摆超过硬接管阈值（疑似卡死）。 */
+function shouldTakeover(owner: GatewayOwner): boolean {
   if (!isProcessAlive(owner.pid)) return true;
+  return isHeartbeatExpiredBeyond(owner, LOCK_HARD_TAKEOVER_MS);
+}
+
+/** 心跳是否已超过软过期阈值（进程活着但心跳停摆，等待其恢复）。 */
+function isHeartbeatExpired(owner: GatewayOwner): boolean {
+  return isHeartbeatExpiredBeyond(owner, LOCK_STALE_MS);
+}
+
+function isHeartbeatExpiredBeyond(owner: GatewayOwner, thresholdMs: number): boolean {
   const heartbeatAt = Date.parse(owner.heartbeatAt);
   if (!Number.isFinite(heartbeatAt)) return true;
-  return Date.now() - heartbeatAt > LOCK_STALE_MS;
+  return Date.now() - heartbeatAt > thresholdMs;
 }
 
 function isProcessAlive(pid: number) {
@@ -203,7 +228,7 @@ function tryAcquireFileLock(lockPath: string) {
   } catch {
     try {
       const age = Date.now() - statSync(lockPath).mtimeMs;
-      if (age > LOCK_STALE_MS) rmSync(lockPath, { recursive: true, force: true });
+      if (age > FILE_LOCK_STALE_MS) rmSync(lockPath, { recursive: true, force: true });
     } catch {}
     return false;
   }

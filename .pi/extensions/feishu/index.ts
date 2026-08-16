@@ -471,12 +471,30 @@ export default function feishuExtension(pi: ExtensionAPI) {
 
   const bootConfig = loadConfig();
 
+  /**
+   * 仅交互会话（TUI / pi-gui）与 daemon 自身允许 autoStart。
+   * 一次性进程（pi -p / --prompt / print / json）以及非 daemon 的 rpc 进程
+   * 不自动启动守护进程——否则每个 pi 调用（如 hbx 技能的 pi -p）都会 spawn
+   * 一个 daemon 抢占网关锁，造成锁抖动、网关反复重启与消息丢失。
+   * 可通过 PI_FEISHU_NO_AUTOSTART=1 硬性关闭。
+   */
+  function autoStartAllowed(): boolean {
+    if (process.env.PI_FEISHU_NO_AUTOSTART === "1") return false;
+    if (process.env.PI_FEISHU_DAEMON === "1") return true;
+    const argv = process.argv.slice(2);
+    if (argv.includes("-p") || argv.includes("--prompt")) return false;
+    const modeIdx = argv.indexOf("--mode");
+    const mode = modeIdx >= 0 ? argv[modeIdx + 1] : undefined;
+    if (mode === "print" || mode === "json" || mode === "rpc") return false;
+    return true;
+  }
+
   pi.on("session_start", async (_event, ctx) => {
     uiRef = ctx.ui as any;
     startStatusRefresh();
   });
 
-  if (bootConfig?.autoStart) {
+  if (bootConfig?.autoStart && autoStartAllowed()) {
     if (process.env.PI_FEISHU_DAEMON === "1") {
       start().then((result) => {
         if (typeof result === "object" && result.status === "owned") {
