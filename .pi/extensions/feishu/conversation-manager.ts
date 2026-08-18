@@ -115,12 +115,37 @@ export class ConversationManager {
           userOnDelta(delta);
         };
       }
+      let hardTimedOut = false;
       try {
         try {
-          await this.runPromptWithTimeouts(session, userText, images, key, onReply, status);
+          await this.runPromptWithTimeouts(
+            session,
+            userText,
+            images,
+            key,
+            onReply,
+            status,
+            (hardMs) => { hardTimedOut = true; },
+          );
         } catch (error) {
           if (run.stopped) {
             debugLog("feishu.prompt.stopped", { key });
+            return;
+          }
+          // 硬超时：明确标记 failed、abort 会话，并保证队列继续（不要吞掉后续 turn）。
+          if (hardTimedOut) {
+            debugLog("feishu.prompt.hard_timeout_turn", {
+              key,
+              runId: run.runId,
+              message: error instanceof Error ? error.message : String(error),
+            });
+            try { await session.abort(); } catch {}
+            run.stopped = true;
+            const timeoutMsg = error instanceof Error ? error.message : String(error);
+            await status?.finish("failed", timeoutMsg);
+            if (status && "ensureFinal" in status && typeof (status as any).ensureFinal === "function") {
+              (status as any).ensureFinal(timeoutMsg);
+            }
             return;
           }
           throw error;
@@ -201,8 +226,28 @@ export class ConversationManager {
       await onReply(message);
       return { status: "not_running", message };
     }
-    if (runId && active.runId && active.runId !== runId) {
-      const message = "这张任务卡片已不是当前进行中的任务。";
+
+    // /stop 文本命令（无 runId）：无条件强制停止当前 active run，
+    // 避免「无卡片挂死 turn 无法中止」的死路。
+    if (!runId) {
+      const forceResult = await this.forceAbortActive(key, "stop");
+      if (!forceResult) {
+        const message = "当前没有进行中的处理。";
+        await onReply(message);
+        return { status: "not_running", message };
+      }
+      if (forceResult.status === "failed") {
+        await onReply("强制停止失败；若任务卡死请发送 /new 强制重置会话。");
+        return forceResult;
+      }
+      await onReply("已强制停止当前任务。若仍无响应，请发送 /new 强制重置会话。");
+      return forceResult;
+    }
+
+    if (active.runId && active.runId !== runId) {
+      // 卡片 stop 的 runId 与当前 active run 不匹配（已是 stale 卡片）。
+      // 不再只返回死路 stale：明确告知用户强制重置路径。
+      const message = "这张任务卡片已不是当前进行中的任务。如任务卡死，请发送 /new 强制重置会话，或点击当前卡片上的「停止」。";
       await onReply(message);
       debugLog("feishu.prompt.stop_stale", { key, runId, activeRunId: active.runId });
       return { status: "stale", message };
@@ -220,28 +265,66 @@ export class ConversationManager {
     } catch (error) {
       active.stopped = false;
       debugLog("feishu.prompt.abort_error", { key, error: error instanceof Error ? error.message : String(error) });
-      const message = "停止失败，请重试。";
+      const message = "停止失败，请重试；若卡死请发送 /new 强制重置。";
       await onReply(message);
       return { status: "failed", message };
     }
   }
 
   async newConversation(key: string, onReply: (text: string) => Promise<void>) {
-    const previous = this.previousTurn(key);
-    const next = previous.then(async () => {
-      const cached = this.sessions.get(key);
-      if (cached) {
-        try { (await cached).dispose(); } catch {}
-      }
-      this.sessions.delete(key);
-      delete this.state.sessions[key];
-      writeJson(STATE_PATH, this.state);
-      await onReply("已创建新会话。旧会话历史已保留，下一条消息会从新上下文开始。");
-    }).catch(async (error) => {
-      await onReply(`Pi error: ${error instanceof Error ? error.message : String(error)}`);
+    // Force-abort any active run first so a hung prompt settles and the queue
+    // can advance — otherwise /new would wait forever behind a dead turn.
+    const forceResult = await this.forceAbortActive(key, "new");
+
+    // 带超时的队列操作：即使上一个 turn 挂死且 abort 未能让它 settle，
+    // /new 也必须在 bound 时间内回复，并强制重置队列，保证后续消息不再排队卡死。
+    const boundedMs = this.newConversationBoundedMs();
+    let timedOut = false;
+    let replied = false;
+    let timer: NodeJS.Timeout | undefined;
+    const resetPromise = new Promise<void>((resolve) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        // 打破队列链：用已 resolve 的 promise 替换，使后续 turn 立即执行。
+        this.queues.set(key, Promise.resolve());
+        resolve();
+      }, boundedMs);
     });
-    this.queues.set(key, next);
-    await next;
+    timer?.unref?.();
+
+    try {
+      await Promise.race([
+        this.previousTurn(key).then(async () => {
+          const cached = this.sessions.get(key);
+          if (cached) {
+            try { (await cached).dispose(); } catch {}
+          }
+          this.sessions.delete(key);
+          delete this.state.sessions[key];
+          writeJson(STATE_PATH, this.state);
+          if (replied) return;
+          replied = true;
+          const resetSuffix = forceResult
+            ? "（已强制停止上一个处理）"
+            : "";
+          await onReply(`已创建新会话。旧会话历史已保留，下一条消息会从新上下文开始。${resetSuffix}`);
+        }).catch(async (error) => {
+          if (replied) return;
+          replied = true;
+          await onReply(`Pi error: ${error instanceof Error ? error.message : String(error)}`);
+        }),
+        resetPromise,
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+
+    // 走超时分支：上一 turn 卡住且 abort 未能让它 settle，已强制重置并补一条明确回复。
+    if (timedOut && !replied) {
+      replied = true;
+      debugLog("feishu.prompt.new_force_reset", { key, reason: "queue blocked by hung turn" });
+      await onReply("上一个处理卡住，已强制重置会话。请重发你的问题。").catch(() => undefined);
+    }
   }
 
   async listResumeSessions(key: string, scope: ResumeScope, page: number): Promise<ResumeSessionPage> {
@@ -493,6 +576,40 @@ export class ConversationManager {
     return this.queues.get(key) || Promise.resolve();
   }
 
+  /**
+   * 无条件中止 key 的当前 active run（不校验 runId/stopped）。
+   * abort 会让挂死的 session.prompt() reject，从而让对应 turn 的队列 promise settle，
+   * 是 /new 与 /stop 逃生通道的关键。返回中止结果；无 active run 时返回 undefined。
+   */
+  private async forceAbortActive(key: string, reason: string): Promise<StopConversationResult | undefined> {
+    const active = this.activeRuns.get(key);
+    if (!active) return undefined;
+    active.stopped = true;
+    const body = active.status?.bodyText || "";
+    await active.status?.stopImmediately("已强制停止").catch(() => undefined);
+    try {
+      await active.session.abort();
+      debugLog("feishu.prompt.force_abort", { key, reason, runId: active.runId ?? null });
+      return { status: "stopped", message: "已强制停止", body };
+    } catch (error) {
+      active.stopped = false;
+      debugLog("feishu.prompt.force_abort_error", {
+        key,
+        reason,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { status: "failed", message: "强制停止失败，请重试；若卡死请发送 /new 强制重置。" };
+    }
+  }
+
+  private newConversationBoundedMs() {
+    // /new 的兜底等待上限：超过即强制重置队列并回复。默认 10s，可用
+    // FEISHU_NEW_CONVERSATION_TIMEOUT_MS 覆盖，最小 100ms。
+    const raw = process.env.FEISHU_NEW_CONVERSATION_TIMEOUT_MS;
+    const n = raw ? Number.parseInt(raw, 10) : 10_000;
+    return Number.isFinite(n) && n >= 100 ? n : 10_000;
+  }
+
   private notifyMs() {
     const sec = this.timeouts.promptNotifySec;
     return typeof sec === "number" && Number.isFinite(sec) && sec > 0 ? sec * 1000 : 0;
@@ -503,6 +620,24 @@ export class ConversationManager {
     return typeof sec === "number" && Number.isFinite(sec) && sec > 0 ? sec * 1000 : 0;
   }
 
+  private lastActivityAt = new Map<string, number>();
+
+  /** 最近一次会话活动的 Unix 毫秒时间戳；无记录时返回 0（视为从不活动）。 */
+  private touchActivity(key: string) {
+    this.lastActivityAt.set(key, Date.now());
+  }
+
+  /**
+   * 活动探针：距 key 最近一次事件（text_delta / tool 事件等）未超过窗口则视为
+   * “正在干活”。硬超时据此变成静默超时，长任务持续产出就不会被误杀。
+   */
+  private isActiveWithin(key: string, windowMs: number): () => boolean {
+    return () => {
+      const last = this.lastActivityAt.get(key) ?? 0;
+      return Date.now() - last < windowMs;
+    };
+  }
+
   private async runPromptWithTimeouts(
     session: AgentSession,
     userText: string,
@@ -510,14 +645,20 @@ export class ConversationManager {
     key: string,
     onReply: (text: string) => Promise<void>,
     status?: ReplyCardSink,
+    onHardTimeoutFired?: (hardMs: number) => void,
   ) {
     const notifyMs = this.notifyMs();
     const hardMs = this.hardTimeoutMs();
     const hardSec = Math.round(hardMs / 1000);
+    // 活动窗口：任何事件（含 thinking/工具调用期间的增量）都会刷新，窗口取 hardMs 的 1/4、
+    // 下限 30s 上限 180s，覆盖 deepseek 长思考段。
+    const activityWindowMs = Math.min(180_000, Math.max(30_000, Math.round(hardMs / 4)));
+    this.touchActivity(key);
     await waitForPrompt(session.prompt(userText, images.length ? { images } : undefined), {
       notifyMs,
       hardMs,
-      hardTimeoutMessage: `Pi 模型处理超时（超过 ${hardSec} 秒）仍未完成，已中止处理。可调大 config.json 中的 promptTimeoutSec。`,
+      hardTimeoutMessage: `Pi 模型无响应超时（连续 ${hardSec} 秒无任何输出）已中止处理。若任务本身耗时长，可调大 config.json 中的 promptTimeoutSec。`,
+      isActive: this.isActiveWithin(key, activityWindowMs),
       onStillRunning: () => {
         debugLog("feishu.prompt.notify_still_running", { key, elapsedMs: notifyMs });
         // A ReplyCard stays visibly "replying"; sending this as a final answer
@@ -528,7 +669,8 @@ export class ConversationManager {
           .catch(() => undefined);
       },
       onHardTimeout: async () => {
-        debugLog("feishu.prompt.hard_timeout", { key, elapsedMs: hardMs });
+        debugLog("feishu.prompt.hard_timeout", { key, elapsedMs: hardMs, runId: this.activeRuns.get(key)?.runId });
+        onHardTimeoutFired?.(hardMs);
         try {
           await session.abort();
         } catch {}
@@ -591,6 +733,8 @@ export class ConversationManager {
       if (event.type === "message_end") {
         this.bridge?.handleMessageEnd(session.sessionId, key, event.message);
       }
+      // 任何事件都算“正在干活”，刷新静默超时计时。
+      this.touchActivity(key);
     });
 
     if (session.sessionFile && this.state.sessions[key] !== session.sessionFile) {

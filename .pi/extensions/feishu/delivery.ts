@@ -3,13 +3,22 @@ import { debugLog } from "./debug.js";
 import type { FeishuRoute } from "./types.js";
 import type { FeishuTransport } from "./transport.js";
 import { buildMarkdownCards, buildPostMessages, chooseMessageMode } from "./rich-text.js";
+import { createHash } from "node:crypto";
 
 const TEXT_CHUNK_MAX_BYTES = 120 * 1024;
 
 export class FeishuDelivery {
   private sdkClient: any;
+  private sendSeq = 0;
 
   constructor(private readonly getTransport: () => FeishuTransport | undefined) {}
+
+  /** 外发消息幂等键：防止超时重试造成消息重复 */
+  private nextSendUuid(kind: string, target: string): string {
+    this.sendSeq += 1;
+    const raw = `${kind}:${target}:${this.sendSeq}:${Date.now().toString(36)}`;
+    return createHash("sha1").update(raw).digest("hex").slice(0, 32);
+  }
 
   async send(route: FeishuRoute, text: string) {
     const transport = this.getTransport();
@@ -53,7 +62,7 @@ export class FeishuDelivery {
     for (const chunk of splitText(text, TEXT_CHUNK_MAX_BYTES)) {
       await this.sdkClient.im.message.reply({
         path: { message_id: messageId },
-        data: { msg_type: "text", content: JSON.stringify({ text: chunk }) },
+        data: { msg_type: "text", content: JSON.stringify({ text: chunk }), uuid: this.nextSendUuid("dlv-reply-text", messageId) },
       });
     }
   }
@@ -76,6 +85,7 @@ export class FeishuDelivery {
           receive_id: chatId,
           msg_type: "text",
           content: JSON.stringify({ text: chunk }),
+          uuid: this.nextSendUuid("dlv-send-text", chatId),
         },
       });
     }
@@ -87,7 +97,7 @@ export class FeishuDelivery {
     for (const card of buildMarkdownCards(text, cfg?.language)) {
       await this.sdkClient.im.message.reply({
         path: { message_id: messageId },
-        data: { msg_type: "interactive", content: JSON.stringify(card) },
+        data: { msg_type: "interactive", content: JSON.stringify(card), uuid: this.nextSendUuid("dlv-reply-md", messageId) },
       });
     }
   }
@@ -102,6 +112,7 @@ export class FeishuDelivery {
           receive_id: chatId,
           msg_type: "interactive",
           content: JSON.stringify(card),
+          uuid: this.nextSendUuid("dlv-send-md", chatId),
         },
       });
     }
@@ -113,7 +124,7 @@ export class FeishuDelivery {
     for (const post of buildPostMessages(text, cfg?.language)) {
       await this.sdkClient.im.message.reply({
         path: { message_id: messageId },
-        data: { msg_type: "post", content: JSON.stringify(post) },
+        data: { msg_type: "post", content: JSON.stringify(post), uuid: this.nextSendUuid("dlv-reply-post", messageId) },
       });
     }
   }
@@ -128,6 +139,7 @@ export class FeishuDelivery {
           receive_id: chatId,
           msg_type: "post",
           content: JSON.stringify(post),
+          uuid: this.nextSendUuid("dlv-send-post", chatId),
         },
       });
     }

@@ -59,7 +59,9 @@ export const DEFAULT_CONFIG: Pick<
   includeQuotedMessage: true,
   quotedMessageMaxChars: 8000,
   promptNotifySec: 180,
-  promptTimeoutSec: 0,
+  // 默认 600s 硬超时：防止一个挂死的 turn 永久阻塞会话队列。可用
+  // FEISHU_PROMPT_TIMEOUT_SEC 覆盖；设 0 可关闭（不推荐）。
+  promptTimeoutSec: 600,
   sendMaxRetries: 2,
   streamingReply: true,
   // CardKit 客户端逐字打印

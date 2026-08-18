@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { FeishuCardAction, FeishuConfig, FeishuMessage } from "./types.js";
 import { loadConfig } from "./config.js";
 import { debugLog } from "./debug.js";
@@ -35,6 +36,18 @@ export class FeishuTransport {
 
   private sendRetries() {
     return this.config.sendMaxRetries ?? 2;
+  }
+
+  /**
+   * 外发消息幂等键：withRetry 在超时后重试的是同一个 fn 闭包，闭包捕获的
+   * uuid 保持不变，飞书服务端按 uuid 去重，避免"一条 /new 回两条"这类
+   * 超时重试导致的消息重复。seq 在闭包外递增，保证同一次重试复用同一 uuid。
+   */
+  private sendSeq = 0;
+  private nextSendUuid(kind: string, target: string): string {
+    this.sendSeq += 1;
+    const raw = `${kind}:${target}:${this.sendSeq}:${Date.now().toString(36)}`;
+    return createHash("sha1").update(raw).digest("hex").slice(0, 32);
   }
 
   private async apiCall<T = any>(label: string, fn: () => Promise<T>): Promise<T> {
@@ -347,7 +360,7 @@ export class FeishuTransport {
     for (const chunk of chunks) {
       const res = await this.apiCall("feishu.reply.text", () => this.sdkClient.im.message.reply({
         path: { message_id: messageId },
-        data: { msg_type: "text", content: JSON.stringify({ text: chunk }) },
+        data: { msg_type: "text", content: JSON.stringify({ text: chunk }), uuid: this.nextSendUuid("reply-text", messageId) },
       }));
       this.rememberBotOutboundMessageId((res as any)?.data?.message_id as string | undefined);
     }
@@ -360,7 +373,7 @@ export class FeishuTransport {
     for (const chunk of chunks) {
       const res = await this.apiCall("feishu.reply.plain_text", () => this.sdkClient.im.message.reply({
         path: { message_id: messageId },
-        data: { msg_type: "text", content: JSON.stringify({ text: chunk }) },
+        data: { msg_type: "text", content: JSON.stringify({ text: chunk }), uuid: this.nextSendUuid("reply-plain", messageId) },
       }));
       lastId = (res as any)?.data?.message_id as string | undefined;
       this.rememberBotOutboundMessageId(lastId);
@@ -397,6 +410,7 @@ export class FeishuTransport {
           receive_id: chatId,
           msg_type: "text",
           content: JSON.stringify({ text: chunk }),
+          uuid: this.nextSendUuid("send-text", chatId),
         },
       }));
       this.rememberBotOutboundMessageId((res as any)?.data?.message_id as string | undefined);
@@ -408,7 +422,7 @@ export class FeishuTransport {
     for (const { card } of this.buildMarkdownCardPartsWithCopySources(text)) {
       const res = await this.apiCall("feishu.reply.markdown_card", () => this.sdkClient.im.message.reply({
         path: { message_id: messageId },
-        data: { msg_type: "interactive", content: JSON.stringify(card) },
+        data: { msg_type: "interactive", content: JSON.stringify(card), uuid: this.nextSendUuid("reply-md", messageId) },
       }));
       this.rememberBotOutboundMessageId((res as any)?.data?.message_id as string | undefined);
     }
@@ -423,6 +437,7 @@ export class FeishuTransport {
           receive_id: chatId,
           msg_type: "interactive",
           content: JSON.stringify(card),
+          uuid: this.nextSendUuid("send-md", chatId),
         },
       }));
       this.rememberBotOutboundMessageId((res as any)?.data?.message_id as string | undefined);
@@ -461,7 +476,7 @@ export class FeishuTransport {
     for (const post of buildPostMessages(text, this.config.language)) {
       const res = await this.sdkClient.im.message.reply({
         path: { message_id: messageId },
-        data: { msg_type: "post", content: JSON.stringify(post) },
+        data: { msg_type: "post", content: JSON.stringify(post), uuid: this.nextSendUuid("reply-post", messageId) },
       });
       this.rememberBotOutboundMessageId((res as any)?.data?.message_id as string | undefined);
     }
@@ -476,6 +491,7 @@ export class FeishuTransport {
           receive_id: chatId,
           msg_type: "post",
           content: JSON.stringify(post),
+          uuid: this.nextSendUuid("send-post", chatId),
         },
       });
       this.rememberBotOutboundMessageId((res as any)?.data?.message_id as string | undefined);
@@ -484,10 +500,10 @@ export class FeishuTransport {
 
   async replyCard(messageId: string, card: object) {
     debugLog("feishu.reply.card", { messageId });
-    const res = await this.sdkClient.im.message.reply({
+    const res = await this.apiCall("feishu.reply.card", () => this.sdkClient.im.message.reply({
       path: { message_id: messageId },
-      data: { msg_type: "interactive", content: JSON.stringify(card) },
-    });
+      data: { msg_type: "interactive", content: JSON.stringify(card), uuid: this.nextSendUuid("reply-card", messageId) },
+    }));
     const id = res?.data?.message_id as string | undefined;
     this.rememberBotOutboundMessageId(id);
     return id;
