@@ -143,7 +143,11 @@ export default function feishuExtension(pi: ExtensionAPI) {
       return { status: "owned" as const, owner: lockResult.owner };
     }
     gatewayLock = lockResult.handle;
-    reapDetachedDaemonProcesses({ keepPids: [process.pid] });
+    // 仅在交互宿主（非 daemon）启动时清理孤儿；daemon 自身启动时跳过：
+    // daemon 与其宿主会话（同样带 --mode rpc -e feishu/index.ts 特征）互相
+    // 匹配 looksLikeFeishuDaemon，互为对方的“孤儿” → 互杀 → 启动即死。
+    // 孤儿清理改由 launchd 看门狗与交互式 startDaemon 完成。
+    if (process.env.PI_FEISHU_DAEMON !== "1") reapDetachedDaemonProcesses({ keepPids: [process.pid] });
     gatewayLock.setOnLost(async () => {
       await transport?.stop();
       transport = undefined;
@@ -603,11 +607,20 @@ type DaemonProcessInfo = {
 
 function reapDetachedDaemonProcesses(options: { keepPids?: number[]; extensionPath?: string } = {}) {
   if (process.platform === "win32") return;
+  // daemon 自身不清理孤儿（见 start() 注释）：它与宿主会话互为“孤儿”，
+  // 互杀导致启动即死。若被误调用，直接跳过。
+  if (process.env.PI_FEISHU_DAEMON === "1") return;
 
   const keep = new Set(options.keepPids || []);
   const allProcesses = listProcesses();
   const roots = allProcesses.filter((proc) => looksLikeFeishuDaemon(proc.command, options.extensionPath));
   if (!roots.length) return;
+
+  // 绝不误杀当前网关锁持有者（活着的 daemon）：先读锁，把真正的 owner 加入 keep。
+  const owner = readGatewayOwner();
+  if (owner && Number.isInteger(owner.pid) && owner.pid > 0) {
+    keep.add(owner.pid);
+  }
 
   const byParent = new Map<number, DaemonProcessInfo[]>();
   for (const proc of allProcesses) {
