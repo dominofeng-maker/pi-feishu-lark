@@ -33,6 +33,13 @@ function isRetriableError(error: unknown): boolean {
   }
 
   const msg = `${err.message || ""} ${err.response?.data?.msg || ""}`.toLowerCase();
+  // DNS/解析类错误：lark SDK 的 http 包装层会把 axios 的 ENOTFOUND 拍平为
+  // { message: "getaddrinfo ENOTFOUND open.feishu.cn", ... } 并丢掉 .code 字段，
+  // 若只看 message 关键词永远判定为不可重试 → 启动探测瞬时失败 → daemon 自杀。
+  // 这里必须按 message 再兜一层 DNS 特征识别（2026-08-18 宕机根因之一）。
+  if (msg.includes("getaddrinfo") || msg.includes("enotfound") || msg.includes("eai_again") || msg.includes("dns") || msg.includes("lookup")) {
+    return true;
+  }
   if (msg.includes("timeout") || msg.includes("rate") || msg.includes("temporarily") || msg.includes("try again")) {
     return true;
   }

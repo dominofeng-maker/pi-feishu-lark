@@ -127,10 +127,18 @@ export class FeishuTransport {
 
   private async probeBotOpenId() {
     try {
-      const res = await this.sdkClient.request({
-        url: "/open-apis/bot/v3/info",
-        method: "GET",
-      });
+      // 启动探测必须可重试：Clash fake-DNS / 系统 DNS 抖动的瞬间会抛
+      // ENOTFOUND/EAI_AGAIN，若探测一次性失败，daemon 会在 bootstrap 阶段
+      // process.exit(1) 自杀 —— 这正是 2026-08-18 宕机的主因之一。
+      // 指数退避重试 6 次（约 0.3+0.6+1.2+2.4+4.8+9.6s，总≈19s）后仍失败才放弃。
+      const res = await withRetry(
+        () =>
+          this.sdkClient.request({
+            url: "/open-apis/bot/v3/info",
+            method: "GET",
+          }),
+        { maxRetries: 6, baseDelayMs: 300, label: "feishu.probe_bot_retry" }
+      );
       this.botOpenId = res?.bot?.open_id || res?.data?.bot?.open_id || res?.data?.open_id;
       if (!this.botOpenId) {
         throw new Error(`bot/v3/info response missing open_id: ${JSON.stringify(res).slice(0, 200)}`);

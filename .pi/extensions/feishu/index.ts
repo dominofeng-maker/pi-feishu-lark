@@ -143,6 +143,7 @@ export default function feishuExtension(pi: ExtensionAPI) {
       return { status: "owned" as const, owner: lockResult.owner };
     }
     gatewayLock = lockResult.handle;
+    reapDetachedDaemonProcesses({ keepPids: [process.pid] });
     gatewayLock.setOnLost(async () => {
       await transport?.stop();
       transport = undefined;
@@ -153,7 +154,8 @@ export default function feishuExtension(pi: ExtensionAPI) {
         process.exit(0);
       }
     });
-    transport = new FeishuTransport(cfg, (msg) => messageHandler.handle(msg), async (action) => {
+    // 卡片/按钮动作统一处理，transport 重建时复用（EADDRINUSE 重试）。
+    const handleCardAction = async (action: any) => {
       const copy = parseCopyMarkdownActionValue(action.value);
       if (copy) {
         const source = transport?.getMarkdownCopySource(copy.copySourceId);
@@ -223,7 +225,9 @@ export default function feishuExtension(pi: ExtensionAPI) {
       const models = await conversations.getAvailableModels();
       const currentModel = await conversations.getSelectedModel(selected.key);
       return buildModelCard(selected.key, models, currentModel);
-    });
+    };
+
+    transport = new FeishuTransport(cfg, (msg) => messageHandler.handle(msg), handleCardAction);
     try {
       await transport.start();
       gatewayLock.startHeartbeat();
@@ -231,6 +235,48 @@ export default function feishuExtension(pi: ExtensionAPI) {
       updateStatus("connected");
       return "started";
     } catch (error) {
+      // EADDRINUSE：旧 daemon 仍占着 3001 端口（接管竞态）。杀掉真正占用者并重试一次，
+      // 避免 daemon 因端口冲突反复失败后被 .dsh-respawn 无限拉起、堆积孤儿进程。
+      const message = error instanceof Error ? error.message : String(error);
+      if (/EADDRINUSE/i.test(message)) {
+        debugLog("feishu.gateway.eaddr_inuse", { message });
+        const portOwner = findPortOwner(cfg.cardActionWebhookPort ?? 3001);
+        if (portOwner && portOwner !== process.pid) {
+          debugLog("feishu.gateway.kill_port_owner", { portOwnerPid: portOwner, message });
+          await terminateProcessTree(portOwner);
+          await sleep(500);
+        } else {
+          // 无明确 owner 或无法确定 pid：直接清端口占用进程
+          await clearPortOccupier(cfg.cardActionWebhookPort ?? 3001);
+        }
+        // 重新获取锁并重试一次绑定
+        await gatewayLock.release();
+        gatewayLock = undefined;
+        transport = undefined;
+        const lockRetry = await acquireGatewayLock(process.cwd(), true);
+        if (lockRetry.status !== "acquired") {
+          updateStatus("owned");
+          return { status: "owned" as const, owner: lockRetry.owner };
+        }
+        gatewayLock = lockRetry.handle;
+        gatewayLock.setOnLost(async () => {
+          await transport?.stop();
+          transport = undefined;
+          gatewayLock = undefined;
+          updateStatus(loadConfig() ? "owned" : "not configured");
+          if (process.env.PI_FEISHU_DAEMON === "1") {
+            terminateLauncherParent();
+            process.exit(0);
+          }
+        });
+        transport = new FeishuTransport(cfg, (msg) => messageHandler.handle(msg), handleCardAction);
+        await transport.start();
+        gatewayLock.startHeartbeat();
+        await gatewayLock.update("connected");
+        updateStatus("connected");
+        debugLog("feishu.gateway.bind_retry_ok", { message });
+        return "started";
+      }
       updateStatus(error instanceof BotUnavailableError ? "bot unavailable" : "disconnected");
       await gatewayLock.release();
       gatewayLock = undefined;
@@ -297,7 +343,10 @@ export default function feishuExtension(pi: ExtensionAPI) {
       if (owner?.pid === process.pid || transport?.isRunning()) {
         await stop();
       } else if (owner && takeover) {
-        try { process.kill(owner.pid, "SIGTERM"); } catch {}
+        // 接管：先 SIGTERM，宽限后若仍存活则 SIGKILL 整棵进程树（含 process group），
+        // 彻底释放 3001 端口，避免新 daemon 起来时 EADDRINUSE。
+        const killed = await terminateProcessTree(owner.pid);
+        if (!killed) debugLog("feishu.gateway.takeover_kill_not_needed", { ownerPid: owner.pid });
         await sleep(800);
       }
 
@@ -496,16 +545,33 @@ export default function feishuExtension(pi: ExtensionAPI) {
 
   if (bootConfig?.autoStart && autoStartAllowed()) {
     if (process.env.PI_FEISHU_DAEMON === "1") {
-      start().then((result) => {
-        if (typeof result === "object" && result.status === "owned") {
-          console.error("[feishu] daemon found existing owner, exiting:", formatOwner(result.owner));
-          process.exit(0);
+      // 守护进程 bootstrap 必须抗瞬时故障（DNS 抖动 / 远端 5xx）。
+      // start() 失败后不直接自杀，而是指数退避重试（≈ 5s+10s+20s+40s+80s+160s，
+      // 上限 5 次，总窗口约 5 分钟）；配合外层 launchd guardian 永久兜底。
+      const bootRetry = async (attempt: number) => {
+        try {
+          const result = await start();
+          if (typeof result === "object" && result.status === "owned") {
+            console.error("[feishu] daemon found existing owner, exiting:", formatOwner(result.owner));
+            terminateLauncherParent();
+            process.exit(0);
+          }
+        } catch (error) {
+          const delay = 5000 * 2 ** attempt;
+          console.error(
+            `[feishu] daemon autoStart attempt ${attempt + 1} failed, retry in ${Math.round(delay / 1000)}s:`, error instanceof Error ? error.message : error
+          );
+          if (attempt >= 5) {
+            console.error("[feishu] daemon autoStart exhausted retries, giving up.");
+            updateStatus(error instanceof BotUnavailableError ? "bot unavailable" : "disconnected");
+            terminateLauncherParent();
+            process.exit(1);
+          }
+          await new Promise((r) => setTimeout(r, delay));
+          void bootRetry(attempt + 1);
         }
-      }).catch((error) => {
-        updateStatus(error instanceof BotUnavailableError ? "bot unavailable" : "disconnected");
-        console.error("[feishu] daemon autoStart failed:", error instanceof Error ? error.message : error);
-        process.exit(1);
-      });
+      };
+      void bootRetry(0);
     } else {
       startDaemon(false).catch((error) => {
         updateStatus("disconnected");
@@ -515,6 +581,7 @@ export default function feishuExtension(pi: ExtensionAPI) {
   }
 
   pi.on("session_shutdown", async () => {
+    await stop();
     await stop();
     clearStatus();
   });
@@ -559,6 +626,72 @@ function reapDetachedDaemonProcesses(options: { keepPids?: number[]; extensionPa
   for (const pid of [...toKill].sort((a, b) => b - a)) {
     if (keep.has(pid) || pid === process.pid) continue;
     try { process.kill(pid, "SIGTERM"); } catch {}
+    try { process.kill(pid, "SIGKILL"); } catch {}
+  }
+}
+
+/**
+ * Terminate a daemon process and its whole descendant tree (and its process
+ * group). First SIGTERM, then after a short grace SIGKILL anything still alive.
+ * Returns true if at least one process was signalled.
+ */
+async function terminateProcessTree(rootPid: number): Promise<boolean> {
+  if (!Number.isInteger(rootPid) || rootPid <= 0 || rootPid === process.pid) return false;
+  let touched = false;
+
+  const signal = (pid: number, sig: NodeJS.Signals) => {
+    try { process.kill(pid, sig); touched = true; } catch {}
+  };
+
+  // 1) SIGTERM 先给优雅退出的机会
+  const all = listProcesses();
+  const byParent = new Map<number, DaemonProcessInfo[]>();
+  for (const proc of all) {
+    const children = byParent.get(proc.ppid) || [];
+    children.push(proc);
+    byParent.set(proc.ppid, children);
+  }
+  const tree = new Set<number>();
+  collectDescendantPids(rootPid, byParent, tree, new Set());
+  tree.add(rootPid);
+
+  // 2) 尝试负 pid（进程组）
+  signal(-Math.abs(rootPid), "SIGTERM");
+  for (const pid of [...tree].sort((a, b) => b - a)) signal(pid, "SIGTERM");
+
+  await sleep(400);
+
+  // 3) 仍存活者 SIGKILL
+  if (isProcAlive(rootPid)) signal(-Math.abs(rootPid), "SIGKILL");
+  for (const pid of [...tree].sort((a, b) => b - a)) {
+    if (isProcAlive(pid)) signal(pid, "SIGKILL");
+  }
+  return touched;
+}
+
+function isProcAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+/** 找出监听指定端口（LISTEN）的 pid；找不到返回 undefined。 */
+function findPortOwner(port: number): number | undefined {
+  try {
+    const result = spawnSync("lsof", ["-nP", "-t", `-iTCP:${port}`, "-sTCP:LISTEN"], { encoding: "utf8" });
+    if (result.status !== 0) return undefined;
+    for (const line of result.stdout.split("\n")) {
+      const pid = Number.parseInt(line.trim(), 10);
+      if (Number.isInteger(pid) && pid > 0) return pid;
+    }
+  } catch {}
+  return undefined;
+}
+
+/** 尽力清理占用端口的进程（找不到 pid 时的最后手段，向进程组根发送 KILL）。 */
+function clearPortOccupier(port: number) {
+  const owner = findPortOwner(port);
+  if (owner && owner !== process.pid) {
+    void terminateProcessTree(owner);
   }
 }
 
@@ -590,7 +723,12 @@ function listProcesses() {
 }
 
 function looksLikeFeishuDaemon(command: string, extensionPath?: string) {
-  const hasDaemonFlags = command.includes("--mode rpc")
+  // 容忍引号：实际命令行可能是 `--mode rpc` 或 `'--mode' 'rpc'`（daemon 由
+  // `tail -f /dev/null | exec 'pi' '--mode' 'rpc' ...` 拉起时带单引号）。
+  // 旧实现用 command.includes("--mode rpc") 匹配，带引号时永远失败 →
+  // reapDetachedDaemonProcesses 从不清理孤儿进程，respawn 循环无限堆积。
+  const hasDaemonFlags =
+    /['"]?--mode['"]?\s+['"]?rpc['"]?/.test(command)
     && command.includes("--no-extensions")
     && command.includes("--no-builtin-tools");
   if (!hasDaemonFlags) return false;
@@ -603,14 +741,26 @@ function terminateLauncherParent() {
   const parentPid = process.ppid;
   if (!parentPid || parentPid <= 1) return;
 
-  const result = spawnSync("ps", ["-wwaxo", "pid=,command="], { encoding: "utf8" });
+  const result = spawnSync("ps", ["-wwaxo", "pid=,ppid=,command="], { encoding: "utf8" });
   if (result.status !== 0) return;
 
-  const line = result.stdout.split("\n")
+  const lines = result.stdout.split("\n")
     .map((entry) => entry.trim())
-    .find((entry) => entry.startsWith(`${parentPid} `));
-  if (!line) return;
-  if (!line.includes("tail -f /dev/null") || !line.includes("feishu/index.ts")) return;
+    .filter(Boolean);
+  // 确认父进程是 feishu daemon 的 launcher（bash wrapper），避免误杀无关进程
+  const parentLine = lines.find((entry) => entry.startsWith(`${parentPid} `));
+  if (!parentLine) return;
+  if (!parentLine.includes("tail -f /dev/null") || !parentLine.includes("feishu/index.ts")) return;
+
+  // 杀掉 launcher 家族：父（bash wrapper）+ 其子进程（tail -f /dev/null 兄弟），
+  // 否则 daemon 退出后 bash 等管道、tail 永不结束，双双变成 ppid=1 孤儿。
+  for (const line of lines) {
+    const match = line.match(/^(\d+)\s+(\d+)\s+(.*)$/);
+    if (!match) continue;
+    if (Number(match[2]) === parentPid) {
+      try { process.kill(Number(match[1]), "SIGTERM"); } catch {}
+    }
+  }
   try { process.kill(parentPid, "SIGTERM"); } catch {}
 }
 
